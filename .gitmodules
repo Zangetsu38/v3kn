@@ -1,0 +1,9 @@
+[submodule "external/cpp-httplib"]
+    path = external/cpp-httplib
+    url = https://github.com/yhirose/cpp-httplib.git
+[submodule "external/json"]
+    path = external/json
+    url = https://github.com/nlohmann/json.git
+[submodule "external/pugixml"]
+	path = external/pugixml
+	url = https://github.com/zeux/pugixml
