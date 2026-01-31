@@ -228,14 +228,28 @@ static void log(const std::string &msg) {
     char timebuf[32];
     std::strftime(timebuf, sizeof(timebuf), "%d-%m-%Y %H:%M:%S", &tm);
 
-    // 2. Complet message.
+    // 2. Build log message
     std::string full = std::string("[") + timebuf + "] " + msg;
 
     // 3. Console
     std::cout << full << std::endl;
 
-    // 4. Log File
-    std::ofstream f("v3kn.log", std::ios::app);
+    // 4. Build folder structure: logs/YYYY/MM/
+    char yearbuf[8], monthbuf[8], daybuf[8];
+    std::strftime(yearbuf, sizeof(yearbuf), "%Y", &tm);
+    std::strftime(monthbuf, sizeof(monthbuf), "%m", &tm);
+    std::strftime(daybuf, sizeof(daybuf), "%d", &tm);
+
+    fs::path folder = fs::path("logs") / yearbuf / monthbuf;
+
+    // Create directories if needed
+    fs::create_directories(folder);
+
+    // 5. File path: logs/YYYY/MM/DD.log
+    fs::path filepath = folder / (std::string(daybuf) + ".log");
+
+    // 6. Append to file
+    std::ofstream f(filepath, std::ios::app);
     f << full << "\n";
 }
 
