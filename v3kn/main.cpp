@@ -234,6 +234,12 @@ static void log(const std::string &msg) {
     // 3. Console
     std::cout << full << std::endl;
 
+    // Main log
+    {
+        std::ofstream root("v3kn.log", std::ios::app);
+        root << full << "\n";
+    }
+
     // 4. Build folder structure: logs/YYYY/MM/
     char yearbuf[8], monthbuf[8], daybuf[8];
     std::strftime(yearbuf, sizeof(yearbuf), "%Y", &tm);
