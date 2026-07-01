@@ -16,7 +16,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       - name: Format check
         run: .github/format-check.sh
@@ -49,7 +49,7 @@ jobs:
           #  extra_cmake_args: -DCMAKE_TOOLCHAIN_FILE=C:\vcpkg\scripts\buildsystems\vcpkg.cmake -DVCPKG_TARGET_TRIPLET=x64-windows-static-md
           #  cmake_preset: windows-ninja
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
           submodules: recursive
@@ -71,7 +71,7 @@ jobs:
           arch: ${{ matrix.arch }}
         if: runner.os == 'Windows'
 
-      - uses: actions/cache@v5
+      - uses: actions/cache@v6
         with:
           path: ${{ matrix.cache_path }}
           key: cache-${{ matrix.os }}-${{ env.BUILD_CONFIG }}-${{ github.sha }}
@@ -113,7 +113,7 @@ jobs:
       github.ref == 'refs/heads/master' &&
       github.repository == 'Zangetsu38/v3kn'
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
