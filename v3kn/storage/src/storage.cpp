@@ -439,6 +439,18 @@ void handle_check_trophy_conf_data(const httplib::Request &req, httplib::Respons
     }
 }
 
+static bool is_valid_trophy_conf_filename(const std::string &filename) {
+    if (filename == "TROPCONF.SFM" || filename == "TROP.SFM" || filename == "ICON0.PNG")
+        return true;
+
+    return filename.size() == 11
+        && filename.compare(0, 4, "TROP") == 0
+        && filename.compare(7, 4, ".PNG") == 0
+        && std::all_of(filename.begin() + 4, filename.begin() + 7, [](unsigned char c) {
+               return c >= '0' && c <= '9';
+           });
+}
+
 void handle_upload_trophy_conf_data(const httplib::Request &req, httplib::Response &res) {
     std::lock_guard<std::mutex> req_lock(request_mutex);
 
@@ -466,6 +478,12 @@ void handle_upload_trophy_conf_data(const httplib::Request &req, httplib::Respon
     }
 
     const auto file = req.form.get_file("file");
+    if (!is_valid_trophy_conf_filename(file.filename)) {
+        log("online ID " + online_id + " tried to upload trophy conf data with invalid filename: " + file.filename);
+        res.set_content("ERR:InvalidFilename", "text/plain");
+        return;
+    }
+
     const fs::path base_path{ fs::path("v3kn") / "Trophies" / id };
     const fs::path file_path{ base_path / file.filename };
 

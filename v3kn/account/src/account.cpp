@@ -711,6 +711,11 @@ void handle_get_avatar(const httplib::Request &req, httplib::Response &res) {
         return;
     }
 
+    if (!is_valid_online_id(target_online_id, "avatar download", err)) {
+        res.set_content(err, "text/plain");
+        return;
+    }
+
     const fs::path avatar_path = fs::path("v3kn") / "Users" / target_online_id / "Avatar.png";
     if (!fs::exists(avatar_path)) {
         res.set_content("ERR:NoAvatar", "text/plain");
@@ -811,6 +816,11 @@ void handle_get_panel(const httplib::Request &req, httplib::Response &res) {
     if (target_online_id.empty()) {
         log("Missing target online ID on panel download attempt by online ID " + online_id);
         res.set_content("ERR:MissingTargetOnlineID", "text/plain");
+        return;
+    }
+
+    if (!is_valid_online_id(target_online_id, "panel download", err)) {
+        res.set_content(err, "text/plain");
         return;
     }
 
