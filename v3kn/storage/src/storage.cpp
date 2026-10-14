@@ -6,6 +6,7 @@
 
 #include <pugixml.hpp>
 
+#include <algorithm>
 #include <fstream>
 #include <sstream>
 
@@ -441,6 +442,15 @@ void handle_check_trophy_conf_data(const httplib::Request &req, httplib::Respons
 
 static bool is_valid_trophy_conf_filename(const std::string &filename) {
     if (filename == "TROPCONF.SFM" || filename == "TROP.SFM" || filename == "ICON0.PNG")
+        return true;
+
+    const bool is_localized_sfm = filename.size() == 10
+        && filename.compare(0, 4, "TROP") == 0
+        && filename.compare(6, 4, ".SFM") == 0
+        && std::all_of(filename.begin() + 4, filename.begin() + 6, [](unsigned char c) {
+               return c >= '0' && c <= '9';
+           });
+    if (is_localized_sfm)
         return true;
 
     return filename.size() == 11
