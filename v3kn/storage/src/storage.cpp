@@ -444,12 +444,13 @@ static bool is_valid_trophy_conf_filename(const std::string &filename) {
     if (filename == "TROPCONF.SFM" || filename == "TROP.SFM" || filename == "ICON0.PNG")
         return true;
 
-    const bool is_localized_sfm = filename.size() == 10
-        && filename.compare(0, 4, "TROP") == 0
-        && filename.compare(6, 4, ".SFM") == 0
-        && std::all_of(filename.begin() + 4, filename.begin() + 6, [](unsigned char c) {
+    const bool is_localized_sfm = filename.size() == 11
+        && filename.compare(0, 5, "TROP_") == 0
+        && filename.compare(7, 4, ".SFM") == 0
+        && std::all_of(filename.begin() + 5, filename.begin() + 7, [](unsigned char c) {
                return c >= '0' && c <= '9';
-           });
+           })
+        && (filename[5] == '0' || filename[5] == '1');
     if (is_localized_sfm)
         return true;
 
