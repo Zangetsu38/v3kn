@@ -31,12 +31,12 @@ jobs:
           - os: ubuntu-latest
             arch: x86_64
             cache_path: ~/.ccache
-            cmake_preset: linux-ninja-clang
+            cmake_preset: linux-ninja-gnu
 
           - os: ubuntu-24.04-arm
             arch: aarch64
             cache_path: ~/.ccache
-            cmake_preset: linux-ninja-clang
+            cmake_preset: linux-ninja-gnu
 
           #- os: windows-latest
           #  arch: x86_64

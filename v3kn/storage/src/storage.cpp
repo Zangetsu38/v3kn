@@ -10,6 +10,22 @@
 #include <cctype>
 #include <fstream>
 #include <sstream>
+#include <string_view>
+
+static bool is_ascii_digit(char c) {
+    return c >= '0' && c <= '9';
+}
+
+static bool is_valid_savedata_id(std::string_view id) {
+    return id.size() == 9 && id.starts_with("PCS") && id[3] >= 'A' && id[3] <= 'Z'
+        && std::all_of(id.begin() + 4, id.end(), is_ascii_digit);
+}
+
+static bool is_valid_trophy_id(std::string_view id) {
+    return id.size() == 12 && id.starts_with("NPWR") && id[9] == '_'
+        && std::all_of(id.begin() + 4, id.begin() + 9, is_ascii_digit)
+        && std::all_of(id.begin() + 10, id.end(), is_ascii_digit);
+}
 
 void register_storage_endpoints(httplib::Server &server) {
     server.Get("/v3kn/save_info", handle_get_save_info);
@@ -25,20 +41,24 @@ void register_storage_endpoints(httplib::Server &server) {
 void handle_get_save_info(const httplib::Request &req, httplib::Response &res) {
     std::shared_lock<std::shared_mutex> lifecycle_lock(account_lifecycle_mutex);
 
-    std::string err;
-    const auto account = get_valid_account(req, "save info request", err);
+    const auto account = get_valid_account(req, "save info request");
     if (!account) {
-        res.set_content(err, "text/plain");
+        res.set_content(account.error(), "text/plain");
         return;
     }
 
     const std::string account_id = account->account_id;
     const std::string online_id = account->online_id;
 
-    auto titleid = req.get_param_value("titleid");
+    const auto titleid = req.get_param_value("titleid");
     if (titleid.empty()) {
         log("Missing TitleID on save info request for online ID " + online_id);
         res.set_content("ERR:MissingTitleID", "text/plain");
+        return;
+    }
+    if (!is_valid_savedata_id(titleid)) {
+        log("Invalid TitleID on save info request for online ID " + online_id);
+        res.set_content("ERR:InvalidTitleID", "text/plain");
         return;
     }
 
@@ -67,10 +87,9 @@ void handle_get_save_info(const httplib::Request &req, httplib::Response &res) {
 void handle_get_trophies_info(const httplib::Request &req, httplib::Response &res) {
     std::shared_lock<std::shared_mutex> lifecycle_lock(account_lifecycle_mutex);
 
-    std::string err;
-    const auto account = get_valid_account(req, "trophies info request", err);
+    const auto account = get_valid_account(req, "trophies info request");
     if (!account) {
-        res.set_content(err, "text/plain");
+        res.set_content(account.error(), "text/plain");
         return;
     }
 
@@ -95,10 +114,9 @@ void handle_get_trophies_info(const httplib::Request &req, httplib::Response &re
 void handle_download_file(const httplib::Request &req, httplib::Response &res) {
     std::shared_lock<std::shared_mutex> lifecycle_lock(account_lifecycle_mutex);
 
-    std::string err;
-    const auto account = get_valid_account(req, "file download", err);
+    const auto account = get_valid_account(req, "file download");
     if (!account) {
-        res.set_content(err, "text/plain");
+        res.set_content(account.error(), "text/plain");
         return;
     }
 
@@ -113,14 +131,14 @@ void handle_download_file(const httplib::Request &req, httplib::Response &res) {
     }
 
     const auto id = req.get_param_value("id");
-    bool invalid_id = false;
+    bool invalid_id;
     if (type == "savedata")
-        invalid_id = !id.starts_with("PCS") || (id.size() != 9);
-    else if (type == "trophy")
-        invalid_id = !id.starts_with("NPWR") || (id.size() != 12);
+        invalid_id = !is_valid_savedata_id(id);
+    else
+        invalid_id = !is_valid_trophy_id(id);
 
     if (invalid_id) {
-        log("online_id " + online_id + " try to download with invalid id: " + id);
+        log("online_id " + online_id + " try to download with invalid id");
         res.set_content("ERR:InvalidID", "text/plain");
         return;
     }
@@ -205,7 +223,7 @@ static void update_trophies_rarity(const std::string &online_id, const std::stri
 
     auto &players_array = players_obj[npcomm_id];
 
-    if (std::find(players_array.begin(), players_array.end(), online_id) == players_array.end())
+    if (!json_array_contains(players_array, online_id))
         players_array.push_back(online_id);
 
     // Find the <np commid="NPWRxxxxx_00">
@@ -240,7 +258,7 @@ static void update_trophies_rarity(const std::string &online_id, const std::stri
         auto &earned_array = trophies_array[trophy_id];
 
         // This check is not really needed since a player should only be able to unlock a trophy once, but we do it just in case to avoid duplicates
-        if (std::find(earned_array.begin(), earned_array.end(), online_id) == earned_array.end())
+        if (!json_array_contains(earned_array, online_id))
             earned_array.push_back(online_id);
     }
 
@@ -257,10 +275,9 @@ static void update_trophies_rarity(const std::string &online_id, const std::stri
 void handle_upload_file(const httplib::Request &req, httplib::Response &res) {
     std::shared_lock<std::shared_mutex> lifecycle_lock(account_lifecycle_mutex);
 
-    std::string err;
-    const auto account = get_valid_account(req, "file upload", err);
+    const auto account = get_valid_account(req, "file upload");
     if (!account) {
-        res.set_content(err, "text/plain");
+        res.set_content(account.error(), "text/plain");
         return;
     }
 
@@ -275,14 +292,14 @@ void handle_upload_file(const httplib::Request &req, httplib::Response &res) {
     }
 
     const auto id = req.get_param_value("id");
-    bool invalid_id = false;
+    bool invalid_id;
     if (type == "savedata")
-        invalid_id = !id.starts_with("PCS") || (id.size() != 9);
-    else if (type == "trophy")
-        invalid_id = !id.starts_with("NPWR") || (id.size() != 12);
+        invalid_id = !is_valid_savedata_id(id);
+    else
+        invalid_id = !is_valid_trophy_id(id);
 
     if (invalid_id) {
-        log("online ID " + online_id + " try to upload with invalid id: " + id);
+        log("online ID " + online_id + " try to upload with invalid id");
         res.set_content("ERR:InvalidID", "text/plain");
         return;
     }
@@ -312,8 +329,7 @@ void handle_upload_file(const httplib::Request &req, httplib::Response &res) {
     uint64_t new_used = 0;
     {
         std::lock_guard<std::mutex> lock_db(account_mutex);
-        json db = load_users();
-        auto &user = db["users"][account_id];
+        json user = accounts.at(account_id);
 
         uint64_t used = user["quota_used"];
         new_used = used + delta;
@@ -326,7 +342,7 @@ void handle_upload_file(const httplib::Request &req, httplib::Response &res) {
 
         user["quota_used"] = new_used;
         user["last_activity"] = std::time(0);
-        save_users(db);
+        save_account(account_id, user);
     }
 
     fs::create_directories(base_path);
@@ -351,10 +367,9 @@ void handle_upload_file(const httplib::Request &req, httplib::Response &res) {
 
 void handle_check_trophy_conf_data(const httplib::Request &req, httplib::Response &res) {
     std::shared_lock<std::shared_mutex> lifecycle_lock(account_lifecycle_mutex);
-    std::string err;
-    const auto account = get_valid_account(req, "trophy conf data check", err);
+    const auto account = get_valid_account(req, "trophy conf data check");
     if (!account) {
-        res.set_content(err, "text/plain");
+        res.set_content(account.error(), "text/plain");
         return;
     }
 
@@ -375,6 +390,11 @@ void handle_check_trophy_conf_data(const httplib::Request &req, httplib::Respons
     auto response = response_doc.append_child("missing_confs");
     for (pugi::xml_node np_node : doc.child("trophies").children("np")) {
         const std::string commid = np_node.attribute("commid").as_string();
+        if (!is_valid_trophy_id(commid)) {
+            log("Invalid trophy ID in trophies.xml for online ID " + online_id);
+            res.set_content("ERR:InvalidID", "text/plain");
+            return;
+        }
 
         const auto mark_missing = [&](const std::string &reason) {
             response.append_child("npcommid").text().set(commid.c_str());
@@ -469,10 +489,9 @@ static bool is_valid_trophy_conf_filename(const std::string &filename) {
 void handle_upload_trophy_conf_data(const httplib::Request &req, httplib::Response &res) {
     std::shared_lock<std::shared_mutex> lifecycle_lock(account_lifecycle_mutex);
 
-    std::string err;
-    const auto account = get_valid_account(req, "trophy conf data upload", err);
+    const auto account = get_valid_account(req, "trophy conf data upload");
     if (!account) {
-        res.set_content(err, "text/plain");
+        res.set_content(account.error(), "text/plain");
         return;
     }
 
@@ -486,8 +505,8 @@ void handle_upload_trophy_conf_data(const httplib::Request &req, httplib::Respon
     }
 
     const auto id = req.get_param_value("id");
-    if (!id.starts_with("NPWR") || (id.size() != 12)) {
-        log("online ID " + online_id + " try to upload trophy conf data with invalid id: " + id);
+    if (!is_valid_trophy_id(id)) {
+        log("online ID " + online_id + " try to upload trophy conf data with invalid id");
         res.set_content("ERR:InvalidID", "text/plain");
         return;
     }
@@ -516,10 +535,9 @@ void handle_upload_trophy_conf_data(const httplib::Request &req, httplib::Respon
 void handle_check_stitle_info(const httplib::Request &req, httplib::Response &res) {
     std::shared_lock<std::shared_mutex> lifecycle_lock(account_lifecycle_mutex);
 
-    std::string err;
-    const auto account = get_valid_account(req, "stitle info check", err);
+    const auto account = get_valid_account(req, "stitle info check");
     if (!account) {
-        res.set_content(err, "text/plain");
+        res.set_content(account.error(), "text/plain");
         return;
     }
 
@@ -548,10 +566,9 @@ void handle_check_stitle_info(const httplib::Request &req, httplib::Response &re
 void handle_upload_stitle_info(const httplib::Request &req, httplib::Response &res) {
     std::shared_lock<std::shared_mutex> lifecycle_lock(account_lifecycle_mutex);
 
-    std::string err;
-    const auto account = get_valid_account(req, "short title info upload", err);
+    const auto account = get_valid_account(req, "short title info upload");
     if (!account) {
-        res.set_content(err, "text/plain");
+        res.set_content(account.error(), "text/plain");
         return;
     }
 

@@ -30,6 +30,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdlib>
+#include <format>
 #include <fstream>
 #include <iostream>
 #include <regex>
@@ -59,7 +60,7 @@ int main() {
 
     v3kn.set_logger([](const httplib::Request &req, const httplib::Response &) {
         const std::string user_agent = req.get_header_value("User-Agent");
-        if (user_agent.find("Vita3K") != std::string::npos) {
+        if (user_agent.contains("Vita3K")) {
             return;
         }
 
@@ -67,7 +68,7 @@ int main() {
         const std::string country = cn.empty() ? "XX" : cn;
         const std::string ip = req.get_header_value("CF-Connecting-IP");
         const std::string remote_addr = ip.empty() ? req.remote_addr : ip;
-        std::string msg = req.method + " " + req.path + " from [" + country + "] " + remote_addr + ":" + std::to_string(req.remote_port);
+        std::string msg = std::format("{} {} from [{}] {}:{}", req.method, req.path, country, remote_addr, req.remote_port);
 
         if (!user_agent.empty())
             msg += "\n  UA: " + user_agent;
@@ -105,55 +106,48 @@ int main() {
     // Clean old log file
     std::ofstream("v3kn.log", std::ios::trunc);
 
-    // Build account_id, online_id and token cache on startup
-    {
-        json db = load_users();
-        if (db.contains("users")) {
-            for (const auto &user : db["users"].items()) {
-                const std::string account_id = user.key();
-                if (!user.value().is_object()) {
-                    continue;
-                }
-
-                const auto &user_data = user.value();
-
-                // Cache the account_id -> online_id mapping
-                if (user_data.contains("online_id") && !user_data["online_id"].empty()) {
-                    const std::string online_id = user_data["online_id"].get<std::string>();
-                    {
-                        std::lock_guard<std::mutex> cache_lock(account_id_cache_mutex);
-                        account_id_cache[account_id] = online_id;
-                    }
-                } else
-                    log("User " + account_id + " has no online_id, skipping online_id cache for this user");
-
-                // Cache the online_id -> account_id mapping
-                if (user_data.contains("online_ids") && user_data["online_ids"].is_array()) {
-                    for (const auto &id : user_data["online_ids"]) {
-                        const std::string online_id = id.get<std::string>();
-                        {
-                            std::lock_guard<std::mutex> cache_lock(online_id_cache_mutex);
-                            online_id_cache[online_id] = account_id;
-                        }
-                    }
-                } else
-                    log("User " + account_id + " has no online_ids array, skipping online_id cache for this user");
-
-                // Cache the token -> account_id mapping
-                if (user_data.contains("token") && !user_data["token"].empty()) {
-                    const std::string token = user_data["token"].get<std::string>();
-                    {
-                        std::lock_guard<std::mutex> cache_lock(token_cache_mutex);
-                        token_cache[token] = account_id;
-                    }
-                } else
-                    log("User " + account_id + " has no token, skipping token cache for this user");
-            }
-            log("Loaded " + std::to_string(account_id_cache.size()) + " account IDs into cache");
-            log("Loaded " + std::to_string(online_id_cache.size()) + " online IDs into cache");
-            log("Loaded " + std::to_string(token_cache.size()) + " tokens into cache");
-        }
+    try {
+        load_users();
+    } catch (const std::exception &error) {
+        std::cerr << "Failed to initialize account storage: " << error.what() << '\n';
+        log("Failed to initialize account storage: " + std::string(error.what()));
+        return EXIT_FAILURE;
     }
+
+    // Build online ID and token caches on startup
+    for (const auto &user : accounts.items()) {
+        const std::string account_id = user.key();
+        if (!user.value().is_object()) {
+            continue;
+        }
+
+        const auto &user_data = user.value();
+
+        // Cache the online_id -> account_id mapping
+        if (user_data.contains("online_ids") && user_data["online_ids"].is_array()) {
+            for (const auto &id : user_data["online_ids"]) {
+                const std::string online_id = id.get<std::string>();
+                {
+                    std::lock_guard<std::mutex> cache_lock(online_id_cache_mutex);
+                    online_id_cache[online_id] = account_id;
+                }
+            }
+        } else
+            log("User " + account_id + " has no online_ids array, skipping online_id cache for this user");
+
+        // Cache the token -> account_id mapping
+        if (user_data.contains("token") && !user_data["token"].empty()) {
+            const std::string token = user_data["token"].get<std::string>();
+            {
+                std::lock_guard<std::mutex> cache_lock(token_cache_mutex);
+                token_cache[token] = account_id;
+            }
+        } else
+            log("User " + account_id + " has no token, skipping token cache for this user");
+    }
+    log("Loaded " + std::to_string(users.size()) + " account IDs");
+    log("Loaded " + std::to_string(online_id_cache.size()) + " online IDs into cache");
+    log("Loaded " + std::to_string(token_cache.size()) + " tokens into cache");
 
     migrate_activities_created_at_to_milliseconds();
 

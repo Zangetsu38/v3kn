@@ -37,6 +37,41 @@ static std::optional<UserAccount> find_existing_online_id_case_insensitive(const
     return std::nullopt;
 }
 
+static void rename_account(const std::string &account_id, const std::string &old_name, const json &user) {
+    const fs::path root = fs::path("v3kn") / "Users";
+    const fs::path old_directory = root / old_name;
+    const std::string new_name = user.at("online_id").get<std::string>();
+    const fs::path new_directory = root / new_name;
+    if (is_unsafe_account_path("v3kn") || is_unsafe_account_path(root)
+        || is_unsafe_account_path(old_directory) || !fs::is_directory(old_directory))
+        throw std::runtime_error("Invalid account directory");
+    if (is_unsafe_account_path(new_directory) || fs::exists(new_directory))
+        throw std::runtime_error("Destination account directory already exists");
+
+    const fs::path old_file = old_directory / "account.json";
+    if (is_unsafe_account_path(old_file) || !fs::is_regular_file(old_file))
+        throw std::runtime_error("Account file missing or invalid");
+    {
+        std::ifstream input(old_file);
+        input.exceptions(std::ios::failbit | std::ios::badbit);
+        json on_disk;
+        input >> on_disk;
+        if (on_disk != accounts.at(account_id))
+            throw std::runtime_error("Account file changed while server is running");
+    }
+
+    try {
+        fs::rename(old_directory, new_directory);
+        save_account(account_id, user);
+        save_users(account_id, new_name);
+        update_profile(new_name, [&](json &profile) { profile["online_id"] = new_name; });
+    } catch (const std::exception &error) {
+        users_failed = true;
+        log("Account rename failed; restart after fixing the problem: " + std::string(error.what()));
+        throw;
+    }
+}
+
 void update_profile_timestamp(const std::string &online_id) {
     update_profile(online_id, [](json &profile) {
         profile["last_updated_activity"] = static_cast<uint64_t>(std::time(0));
@@ -103,9 +138,9 @@ void handle_check_connection(const httplib::Request &req, httplib::Response &res
     std::unique_lock<std::shared_mutex> lifecycle_lock(account_lifecycle_mutex);
 
     std::string err;
-    const auto account = get_valid_account(req, "connection check", err);
+    const auto account = get_valid_account(req, "connection check");
     if (!account) {
-        res.set_content(err, "text/plain");
+        res.set_content(account.error(), "text/plain");
         return;
     }
 
@@ -120,8 +155,7 @@ void handle_check_connection(const httplib::Request &req, httplib::Response &res
     }
 
     std::lock_guard<std::mutex> lock_db(account_mutex);
-    json db = load_users();
-    auto &user = db["users"][account_id];
+    json user = accounts.at(account_id);
     const uint64_t created_at = user["created_at"];
     const uint64_t used = user["quota_used"];
     const uint64_t total = DEFAULT_QUOTA_TOTAL;
@@ -153,7 +187,7 @@ void handle_check_connection(const httplib::Request &req, httplib::Response &res
         };
 
         std::string fixed_online_id = sanitize_online_id(online_id);
-        while (find_existing_online_id_case_insensitive(db["users"], fixed_online_id)) {
+        while (find_existing_online_id_case_insensitive(accounts, fixed_online_id)) {
             // Sufix based on the timestamp (max 3 digits)
             const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
             std::string timestamp_str = "-" + std::to_string(ms % 10000);
@@ -178,13 +212,7 @@ void handle_check_connection(const httplib::Request &req, httplib::Response &res
 
         user["online_ids"].push_back(fixed_online_id);
         user["online_id"] = fixed_online_id;
-        save_users(db);
-        const fs::path users_path = fs::path("v3kn") / "Users";
-        if (fs::exists(users_path / online_id)) {
-            fs::rename(users_path / online_id, users_path / fixed_online_id);
-        } else {
-            log("Online ID directory for " + online_id + " does not exist, cannot rename to " + fixed_online_id);
-        }
+        rename_account(account_id, online_id, user);
 
         log("Updated online ID from " + online_id + " to " + fixed_online_id + " due to invalid characters");
         {
@@ -192,13 +220,6 @@ void handle_check_connection(const httplib::Request &req, httplib::Response &res
             online_id_cache.erase(online_id);
             online_id_cache[fixed_online_id] = account_id;
         }
-        {
-            std::lock_guard<std::mutex> cache_lock(account_id_cache_mutex);
-            account_id_cache[account_id] = fixed_online_id;
-        }
-        update_profile(fixed_online_id, [&](json &profile) {
-            profile["online_id"] = fixed_online_id;
-        });
     }
 
     const std::string current_online_id = user["online_id"].get<std::string>();
@@ -209,18 +230,19 @@ void handle_check_connection(const httplib::Request &req, httplib::Response &res
 void handle_get_quota(const httplib::Request &req, httplib::Response &res) {
     std::shared_lock<std::shared_mutex> lifecycle_lock(account_lifecycle_mutex);
 
-    std::string err;
-    const auto account = get_valid_account(req, "quota retrieval", err);
+    const auto account = get_valid_account(req, "quota retrieval");
     if (!account) {
-        res.set_content(err, "text/plain");
+        res.set_content(account.error(), "text/plain");
         return;
     }
     const std::string account_id = account->account_id;
     const std::string online_id = account->online_id;
 
-    json db = load_users();
-    auto &user = db["users"][account_id];
-    const uint64_t used = user["quota_used"];
+    uint64_t used;
+    {
+        std::lock_guard<std::mutex> lock(account_mutex);
+        used = accounts.at(account_id).at("quota_used");
+    }
     const uint64_t total = DEFAULT_QUOTA_TOTAL;
 
     log("Quota for online ID " + online_id + ": " + std::to_string(used) + " / " + std::to_string(total));
@@ -253,8 +275,7 @@ void handle_create_account(const httplib::Request &req, httplib::Response &res) 
     }
 
     std::lock_guard<std::mutex> lock_db(account_mutex);
-    json db = load_users();
-    const auto existing_account = find_existing_online_id_case_insensitive(db["users"], online_id);
+    const auto existing_account = find_existing_online_id_case_insensitive(accounts, online_id);
     if (existing_account) {
         log("Account creation attempt for existing online ID " + online_id);
         res.set_content("ERR:UserExists", "text/plain");
@@ -264,11 +285,18 @@ void handle_create_account(const httplib::Request &req, httplib::Response &res) 
     const std::string password = base64_decode(base64_password);
     const std::vector<unsigned char> salt = generate_salt();
     const std::vector<unsigned char> server_hash = compute_server_hash(password, salt);
-    const std::string token = generate_token();
+    const auto token = generate_token();
+    if (!token) {
+        res.status = 500;
+        res.set_content("ERR:InternalError", "text/plain");
+        return;
+    }
 
     const std::time_t current_time = std::time(0);
-    const auto account_id = generate_account_id(current_time);
-    auto &user = db["users"][account_id];
+    auto account_id = generate_account_id(current_time);
+    while (accounts.contains(account_id))
+        account_id = generate_account_id(current_time);
+    json user = json::object();
     user["created_at"] = current_time;
     user["last_activity"] = current_time;
     user["last_login"] = current_time;
@@ -277,15 +305,22 @@ void handle_create_account(const httplib::Request &req, httplib::Response &res) 
     user["online_id"] = online_id;
     user["password"] = base64_encode(std::string(server_hash.begin(), server_hash.end()));
     user["salt"] = base64_encode(std::string(salt.begin(), salt.end()));
-    user["token"] = token;
+    user["token"] = *token;
 
     update_remote_addr(req, user);
-    save_users(db);
-
-    // Update the account_id -> online_id cache with the new account ID
-    {
-        std::lock_guard<std::mutex> cache_lock(account_id_cache_mutex);
-        account_id_cache[account_id] = online_id;
+    const auto account_path = fs::path("v3kn") / "Users" / online_id;
+    if (is_unsafe_account_path("v3kn") || is_unsafe_account_path(account_path.parent_path())
+        || is_unsafe_account_path(account_path) || fs::exists(account_path))
+        throw std::runtime_error("Destination account directory already exists or is unsafe");
+    try {
+        if (!fs::create_directory(account_path))
+            throw std::runtime_error("Cannot create account directory");
+        save_account(account_id, user);
+        save_users(account_id, online_id);
+    } catch (const std::exception &error) {
+        users_failed = true;
+        log("Account creation failed; restart after fixing the problem: " + std::string(error.what()));
+        throw;
     }
 
     // Update the online_id -> account_id cache with the new online ID
@@ -297,29 +332,27 @@ void handle_create_account(const httplib::Request &req, httplib::Response &res) 
     // Update the token -> account_id cache with the new token
     {
         std::lock_guard<std::mutex> cache_lock(token_cache_mutex);
-        token_cache[token] = account_id;
+        token_cache[*token] = account_id;
     }
 
-    const auto account_path = fs::path("v3kn") / "Users" / online_id;
     fs::create_directories(account_path / "savedata");
     fs::create_directories(account_path / "trophy");
 
     // Create a minimal profile for the new account
     update_profile(online_id, [](json &) {});
 
-    const size_t user_count = db["users"].size();
+    const size_t user_count = accounts.size();
 
     log("Created account for Account ID " + account_id + " with online ID " + online_id + ", user #" + std::to_string(user_count));
-    res.set_content("OK:" + token, "text/plain");
+    res.set_content("OK:" + *token, "text/plain");
 }
 
 void handle_delete_account(const httplib::Request &req, httplib::Response &res) {
     std::unique_lock<std::shared_mutex> lifecycle_lock(account_lifecycle_mutex);
 
-    std::string err;
-    const auto account = get_valid_account(req, "account deletion", err);
+    const auto account = get_valid_account(req, "account deletion");
     if (!account) {
-        res.set_content(err, "text/plain");
+        res.set_content(account.error(), "text/plain");
         return;
     }
 
@@ -336,8 +369,7 @@ void handle_delete_account(const httplib::Request &req, httplib::Response &res) 
     const std::string password = base64_decode(base64_password);
 
     std::lock_guard<std::mutex> lock(account_mutex);
-    json db = load_users();
-    auto &user = db["users"][account_id];
+    const json user = accounts.at(account_id);
 
     const std::string base64_salt = user["salt"];
     const std::string salt_str = base64_decode(base64_salt);
@@ -352,6 +384,35 @@ void handle_delete_account(const httplib::Request &req, httplib::Response &res) 
         return;
     }
 
+    const fs::path root = fs::path("v3kn") / "Users";
+    const fs::path directory = root / online_id;
+    if (is_unsafe_account_path("v3kn") || is_unsafe_account_path(root)
+        || is_unsafe_account_path(directory) || !fs::is_directory(directory))
+        throw std::runtime_error("Invalid account directory");
+    try {
+        const fs::path path = directory / "account.json";
+        if (is_unsafe_account_path(path) || !fs::is_regular_file(path))
+            throw std::runtime_error("Account file missing or invalid");
+        {
+            std::ifstream input(path);
+            input.exceptions(std::ios::failbit | std::ios::badbit);
+            json on_disk;
+            input >> on_disk;
+            if (on_disk != user)
+                throw std::runtime_error("Account file changed while server is running");
+        }
+        for (const auto &entry : fs::recursive_directory_iterator(directory))
+            if (is_unsafe_account_path(entry.path()))
+                throw std::runtime_error("Unsafe link in account directory");
+        save_users(account_id, "");
+        fs::remove_all(directory);
+        accounts.erase(account_id);
+    } catch (const std::exception &error) {
+        users_failed = true;
+        log("Account deletion failed; restart after fixing the problem: " + std::string(error.what()));
+        throw;
+    }
+
     // Remove all online IDs of the user from the online ID cache
     for (const auto &id : user["online_ids"]) {
         const std::string existing_online_id = id.get<std::string>();
@@ -361,22 +422,12 @@ void handle_delete_account(const httplib::Request &req, httplib::Response &res) 
         }
     }
 
-    // Remove the user's account ID from the account ID cache
-    {
-        std::lock_guard<std::mutex> cache_lock(account_id_cache_mutex);
-        account_id_cache.erase(account_id);
-    }
-
     // Remove the user's token from the token cache
     {
         std::lock_guard<std::mutex> cache_lock(token_cache_mutex);
         token_cache.erase(user["token"]);
     }
 
-    db["users"].erase(account_id);
-    save_users(db);
-
-    fs::remove_all("v3kn/Users/" + online_id);
     log("Deleting account for online ID " + online_id);
     res.set_content("OK:UserDeleted", "text/plain");
 }
@@ -407,9 +458,8 @@ void handle_login(const httplib::Request &req, httplib::Response &res) {
     const std::string password = base64_decode(base64_password);
 
     std::lock_guard<std::mutex> lock_db(account_mutex);
-    json db = load_users();
 
-    const auto account = find_existing_online_id_case_insensitive(db["users"], login_online_id);
+    const auto account = find_existing_online_id_case_insensitive(accounts, login_online_id);
     if (!account) {
         log("Login attempt for non-existing online ID " + login_online_id);
         res.set_content("ERR:UserNotFound", "text/plain");
@@ -419,7 +469,7 @@ void handle_login(const httplib::Request &req, httplib::Response &res) {
     const auto account_id = account->account_id;
     const auto online_id = account->online_id;
 
-    auto &user = db["users"][account_id];
+    json user = accounts.at(account_id);
     const std::string base64_salt = user["salt"];
     const std::string salt_str = base64_decode(base64_salt);
     const std::vector<unsigned char> salt(salt_str.begin(), salt_str.end());
@@ -439,7 +489,7 @@ void handle_login(const httplib::Request &req, httplib::Response &res) {
     user["last_login"] = std::time(0);
     user["last_activity"] = std::time(0);
     update_remote_addr(req, user);
-    save_users(db);
+    save_account(account_id, user);
 
     update_profile(online_id, [](json &) {});
 
@@ -451,9 +501,9 @@ void handle_change_online_id(const httplib::Request &req, httplib::Response &res
     std::unique_lock<std::shared_mutex> lifecycle_lock(account_lifecycle_mutex);
 
     std::string err;
-    const auto account = get_valid_account(req, "online ID change", err);
+    const auto account = get_valid_account(req, "online ID change");
     if (!account) {
-        res.set_content(err, "text/plain");
+        res.set_content(account.error(), "text/plain");
         return;
     }
 
@@ -467,39 +517,25 @@ void handle_change_online_id(const httplib::Request &req, httplib::Response &res
     }
 
     std::lock_guard<std::mutex> lock_db(account_mutex);
-    json db = load_users();
-    const auto existing_online_id = find_existing_online_id_case_insensitive(db["users"], new_online_id);
+    const auto existing_online_id = find_existing_online_id_case_insensitive(accounts, new_online_id);
     if (existing_online_id) {
         log("Online ID change attempt to existing online ID " + new_online_id + " by user " + online_id);
         res.set_content("ERR:UserExists", "text/plain");
         return;
     }
 
-    auto &user = db["users"][account_id];
+    json user = accounts.at(account_id);
     user["online_ids"].push_back(new_online_id);
     user["online_id"] = new_online_id;
     user["last_activity"] = std::time(0);
     update_remote_addr(req, user);
-    save_users(db);
-
-    // Update the account_id -> online_id cache with the new online ID
-    {
-        std::lock_guard<std::mutex> cache_lock(account_id_cache_mutex);
-        account_id_cache[account_id] = new_online_id;
-    }
+    rename_account(account_id, online_id, user);
 
     // Update the online_id -> account_id cache with the new online ID
     {
         std::lock_guard<std::mutex> cache_lock(online_id_cache_mutex);
         online_id_cache[new_online_id] = account_id;
     }
-
-    fs::rename("v3kn/Users/" + online_id, "v3kn/Users/" + new_online_id);
-
-    // Update the profile with the new online ID
-    update_profile(new_online_id, [&](json &profile) {
-        profile["online_id"] = new_online_id;
-    });
 
     log("User " + online_id + " changed online ID to " + new_online_id);
     res.set_content("OK:OnlineIDChanged", "text/plain");
@@ -508,10 +544,9 @@ void handle_change_online_id(const httplib::Request &req, httplib::Response &res
 void handle_change_password(const httplib::Request &req, httplib::Response &res) {
     std::unique_lock<std::shared_mutex> lifecycle_lock(account_lifecycle_mutex);
 
-    std::string err;
-    const auto account = get_valid_account(req, "password change", err);
+    const auto account = get_valid_account(req, "password change");
     if (!account) {
-        res.set_content(err, "text/plain");
+        res.set_content(account.error(), "text/plain");
         return;
     }
 
@@ -541,8 +576,7 @@ void handle_change_password(const httplib::Request &req, httplib::Response &res)
     const std::string new_password = base64_decode(base64_new_password);
 
     std::lock_guard<std::mutex> lock_db(account_mutex);
-    json db = load_users();
-    auto &user = db["users"][account_id];
+    json user = accounts.at(account_id);
 
     const std::string base64_salt = user["salt"];
     const std::string salt_str = base64_decode(base64_salt);
@@ -560,36 +594,36 @@ void handle_change_password(const httplib::Request &req, httplib::Response &res)
 
     const std::vector<unsigned char> new_salt = generate_salt();
     const std::vector<unsigned char> new_server_hash = compute_server_hash(new_password, new_salt);
+    const auto new_token = generate_token();
+    if (!new_token) {
+        res.status = 500;
+        res.set_content("ERR:InternalError", "text/plain");
+        return;
+    }
 
     const std::string old_token = user["token"];
+    user["password"] = base64_encode(std::string(new_server_hash.begin(), new_server_hash.end()));
+    user["salt"] = base64_encode(std::string(new_salt.begin(), new_salt.end()));
+    user["token"] = *new_token;
+    user["last_activity"] = std::time(0);
+    update_remote_addr(req, user);
+    save_account(account_id, user);
+
     {
         std::lock_guard<std::mutex> cache_lock(token_cache_mutex);
         token_cache.erase(old_token);
-    }
-
-    const std::string new_token = generate_token();
-    user["password"] = base64_encode(std::string(new_server_hash.begin(), new_server_hash.end()));
-    user["salt"] = base64_encode(std::string(new_salt.begin(), new_salt.end()));
-    user["token"] = new_token;
-    user["last_activity"] = std::time(0);
-    update_remote_addr(req, user);
-    save_users(db);
-
-    {
-        std::lock_guard<std::mutex> cache_lock(token_cache_mutex);
-        token_cache[new_token] = account_id;
+        token_cache[*new_token] = account_id;
     }
 
     log("User " + online_id + " changed their password (new token generated).");
-    res.set_content("OK:" + new_token, "text/plain");
+    res.set_content("OK:" + *new_token, "text/plain");
 }
 
 void handle_change_about_me(const httplib::Request &req, httplib::Response &res) {
     std::shared_lock<std::shared_mutex> lifecycle_lock(account_lifecycle_mutex);
-    std::string err;
-    const auto account = get_valid_account(req, "about me change", err);
+    const auto account = get_valid_account(req, "about me change");
     if (!account) {
-        res.set_content(err, "text/plain");
+        res.set_content(account.error(), "text/plain");
         return;
     }
 
@@ -622,10 +656,9 @@ void handle_change_about_me(const httplib::Request &req, httplib::Response &res)
 void handle_upload_avatar(const httplib::Request &req, httplib::Response &res) {
     std::shared_lock<std::shared_mutex> lifecycle_lock(account_lifecycle_mutex);
 
-    std::string err;
-    const auto account = get_valid_account(req, "avatar upload", err);
+    const auto account = get_valid_account(req, "avatar upload");
     if (!account) {
-        res.set_content(err, "text/plain");
+        res.set_content(account.error(), "text/plain");
         return;
     }
 
@@ -691,10 +724,10 @@ void handle_get_avatar(const httplib::Request &req, httplib::Response &res) {
     std::shared_lock<std::shared_mutex> lifecycle_lock(account_lifecycle_mutex);
 
     std::string err;
-    const auto account = get_valid_account(req, "avatar download", err);
+    const auto account = get_valid_account(req, "avatar download");
     if (!account) {
         log("Missing or invalid token on avatar download attempt");
-        res.set_content(err, "text/plain");
+        res.set_content(account.error(), "text/plain");
         return;
     }
     const std::string &account_id = account->account_id;
@@ -731,10 +764,9 @@ void handle_get_avatar(const httplib::Request &req, httplib::Response &res) {
 void handle_upload_panel(const httplib::Request &req, httplib::Response &res) {
     std::shared_lock<std::shared_mutex> lifecycle_lock(account_lifecycle_mutex);
 
-    std::string err;
-    const auto account = get_valid_account(req, "panel upload", err);
+    const auto account = get_valid_account(req, "panel upload");
     if (!account) {
-        res.set_content(err, "text/plain");
+        res.set_content(account.error(), "text/plain");
         return;
     }
 
@@ -800,10 +832,10 @@ void handle_get_panel(const httplib::Request &req, httplib::Response &res) {
     std::shared_lock<std::shared_mutex> lifecycle_lock(account_lifecycle_mutex);
 
     std::string err;
-    const auto account = get_valid_account(req, "panel download", err);
+    const auto account = get_valid_account(req, "panel download");
     if (!account) {
         log("Missing or invalid token on panel download attempt");
-        res.set_content(err, "text/plain");
+        res.set_content(account.error(), "text/plain");
         return;
     }
 

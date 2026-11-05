@@ -4,27 +4,41 @@
 #include "utils/utils.h"
 
 #include <openssl/evp.h>
+#include <openssl/rand.h>
 #include <openssl/sha.h>
 
 #include <algorithm>
+#include <atomic>
+#include <cctype>
 #include <chrono>
 #include <ctime>
 #include <fstream>
 #include <iostream>
 #include <random>
+#include <set>
+#include <stdexcept>
+
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#else
+#include <fcntl.h>
+#include <unistd.h>
+#endif
 
 // Global mutexes
+std::mutex users_mutex;
 std::mutex account_mutex;
 std::mutex stitles_cache_mutex;
 std::mutex log_mutex;
 
 // Cache Mutexes
-std::mutex account_id_cache_mutex;
 std::mutex online_id_cache_mutex;
 std::mutex token_cache_mutex;
 
 // Global caches
-std::unordered_map<std::string, std::string> account_id_cache; // account_id -> online_id
 std::unordered_map<std::string, std::string> online_id_cache; // online_id -> account_id
 std::unordered_map<std::string, std::string> token_cache; // token -> account_id
 
@@ -135,8 +149,6 @@ void cleanup_old_poll_events(int64_t max_age_seconds) {
 }
 
 // Database operations
-static std::mutex users_file_mutex;
-
 static json load_profile_unlocked(const std::string &online_id) {
     const fs::path profile_path{ fs::path("v3kn") / "Users" / online_id / "profile.json" };
     if (fs::exists(profile_path)) {
@@ -184,20 +196,210 @@ void update_profile(const std::string &online_id, const std::function<void(json 
     save_profile_unlocked(online_id, profile);
 }
 
-json load_users() {
-    std::lock_guard<std::mutex> lock(users_file_mutex);
-    std::ifstream f("v3kn/users.json");
-    if (!f.is_open())
-        return json{ { "users", json::object() } };
-    json db;
-    f >> db;
-    return db;
+json users = json::object();
+json accounts = json::object();
+std::atomic<bool> users_failed = false;
+
+bool is_unsafe_account_path(const fs::path &path) {
+#ifdef _WIN32
+    const DWORD attributes = GetFileAttributesW(path.c_str());
+    if (attributes != INVALID_FILE_ATTRIBUTES && (attributes & FILE_ATTRIBUTE_REPARSE_POINT))
+        return true;
+#endif
+    return fs::is_symlink(fs::symlink_status(path));
 }
 
-void save_users(const json &db) {
-    std::lock_guard<std::mutex> lock(users_file_mutex);
-    std::ofstream f("v3kn/users.json");
-    f << db.dump(2);
+static json read_json_with_backup(const fs::path &path, std::vector<std::pair<fs::path, fs::path>> &files_to_restore) {
+    fs::path backup = path;
+    backup += ".previous";
+    if (is_unsafe_account_path(path) || is_unsafe_account_path(backup))
+        throw std::runtime_error("Unsafe account file path: " + path.string());
+    json data;
+    std::ifstream input(path);
+    if (input.is_open()) {
+        try {
+            input >> data;
+            if (!input.bad())
+                return data;
+        } catch (const json::parse_error &) {
+        }
+    }
+    std::ifstream saved(backup);
+    if (!saved.is_open())
+        throw std::runtime_error("Cannot read account file or backup: " + path.string());
+    saved >> data;
+    if (saved.bad())
+        throw std::runtime_error("Cannot read account backup: " + backup.string());
+    files_to_restore.emplace_back(backup, path);
+    return data;
+}
+
+static json load_account(const std::string &online_id, std::set<std::string> &names,
+    std::vector<std::pair<fs::path, fs::path>> &files_to_restore) {
+    if (online_id.empty() || online_id == "." || online_id == ".."
+        || online_id.find('\0') != std::string::npos || fs::path(online_id).has_parent_path()
+        || fs::path(online_id).has_root_name())
+        throw std::runtime_error("Invalid online ID path");
+    std::string directory_name = online_id;
+#ifdef _WIN32
+    std::transform(directory_name.begin(), directory_name.end(), directory_name.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+#endif
+    if (!names.insert(directory_name).second)
+        throw std::runtime_error("duplicate online ID path");
+    const fs::path directory = fs::path("v3kn") / "Users" / online_id;
+    if (is_unsafe_account_path(directory) || !fs::is_directory(directory))
+        throw std::runtime_error("Invalid account directory: " + online_id);
+    json user = read_json_with_backup(directory / "account.json", files_to_restore);
+    if (!user.is_object() || !user.contains("online_id") || user["online_id"] != online_id)
+        throw std::runtime_error("Account does not match index: " + online_id);
+    return user;
+}
+
+void load_users() {
+    const fs::path root = fs::path("v3kn") / "Users";
+    const fs::path index_path = fs::path("v3kn") / "users.json";
+    fs::path index_backup = index_path;
+    index_backup += ".previous";
+    if (fs::exists(fs::path("v3kn") / "users.transaction.json"))
+        throw std::runtime_error("Pending account transaction: start the previous server version to recover it");
+    if (is_unsafe_account_path("v3kn") || is_unsafe_account_path(root))
+        throw std::runtime_error("Unsafe account storage path");
+    fs::create_directories(root);
+    if (is_unsafe_account_path(index_path) || is_unsafe_account_path(index_backup))
+        throw std::runtime_error("Unsafe account index path");
+
+    std::vector<std::pair<fs::path, fs::path>> files_to_restore;
+    if (!fs::exists(index_path) && !fs::exists(index_backup)) {
+        if (!fs::is_empty(root) || fs::exists(fs::path("v3kn") / "users.json.bak"))
+            throw std::runtime_error("Account index missing from existing storage");
+        std::ofstream output(index_path);
+        output.exceptions(std::ios::failbit | std::ios::badbit);
+        output << json{ { "users", json::object() } }.dump(2);
+        output.close();
+    }
+
+    json index = read_json_with_backup(index_path, files_to_restore);
+    if (!index.is_object() || !index.contains("users") || !index["users"].is_object()
+        || (index.contains("version") ? index.size() != 2 || index["version"] != 2 : index.size() != 1))
+        throw std::runtime_error("Invalid account index");
+
+    json loaded_accounts = json::object();
+    std::set<std::string> names;
+    for (const auto &[account_id, name] : index["users"].items()) {
+        if (name.is_object())
+            throw std::runtime_error("legacy account database unsupported; migrate with an older version");
+        if (account_id.empty() || !name.is_string())
+            throw std::runtime_error("Invalid account index entry");
+        const std::string online_id = name.get<std::string>();
+        loaded_accounts[account_id] = load_account(online_id, names, files_to_restore);
+    }
+
+    for (const auto &entry : fs::directory_iterator(root)) {
+        if (!entry.is_directory() || !fs::exists(entry.path() / "account.json"))
+            continue;
+        std::string name = entry.path().filename().string();
+#ifdef _WIN32
+        std::transform(name.begin(), name.end(), name.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+#endif
+        if (!names.contains(name))
+            throw std::runtime_error("Account index conflicts with an existing account directory: " + name);
+    }
+    for (const auto &[backup, path] : files_to_restore) {
+        fs::copy_file(backup, path, fs::copy_options::overwrite_existing);
+        log("Restored account file from backup: " + path.string());
+    }
+
+    users = std::move(index["users"]);
+    accounts = std::move(loaded_accounts);
+}
+
+void save_account(const std::string &account_id, const json &user) {
+    if (users_failed)
+        throw std::runtime_error("Account storage unavailable");
+    const fs::path root = fs::path("v3kn") / "Users";
+    const std::string online_id = user.at("online_id").get<std::string>();
+    if (account_id.empty() || online_id.empty() || online_id == "." || online_id == ".."
+        || online_id.find('\0') != std::string::npos || fs::path(online_id).has_parent_path()
+        || fs::path(online_id).has_root_name())
+        throw std::runtime_error("Invalid account path");
+    const fs::path directory = root / online_id;
+    const fs::path path = directory / "account.json";
+    fs::path backup = path;
+    backup += ".previous";
+    const bool existed = accounts.contains(account_id);
+    try {
+        if (is_unsafe_account_path("v3kn") || is_unsafe_account_path(root)
+            || is_unsafe_account_path(directory) || !fs::is_directory(directory)
+            || is_unsafe_account_path(path) || is_unsafe_account_path(backup))
+            throw std::runtime_error("Unsafe account path");
+        if (existed) {
+            if (!fs::is_regular_file(path))
+                throw std::runtime_error("Account file missing or invalid");
+            std::ifstream input(path);
+            input.exceptions(std::ios::failbit | std::ios::badbit);
+            json on_disk;
+            input >> on_disk;
+            if (on_disk != accounts.at(account_id))
+                throw std::runtime_error("Account file changed while server is running");
+            fs::copy_file(path, backup, fs::copy_options::overwrite_existing);
+        } else {
+            if (fs::exists(path))
+                throw std::runtime_error("Account file already exists");
+#ifndef _WIN32
+            const int fd = ::open(path.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0600);
+            if (fd < 0)
+                throw std::runtime_error("Cannot create private account file");
+            if (::close(fd) != 0)
+                throw std::runtime_error("Cannot close new account file");
+#endif
+        }
+        std::ofstream output(path);
+        output.exceptions(std::ios::failbit | std::ios::badbit);
+        output << user.dump(2);
+        output.close();
+        if (!existed)
+            fs::copy_file(path, backup);
+        accounts[account_id] = user;
+    } catch (const std::exception &error) {
+        users_failed = true;
+        log("Account storage failed; restart after fixing the problem: " + std::string(error.what()));
+        throw;
+    }
+}
+
+void save_users(const std::string &account_id, const std::string &online_id) {
+    std::lock_guard<std::mutex> lock(users_mutex);
+    if (users_failed)
+        throw std::runtime_error("Account storage unavailable");
+    const fs::path path = fs::path("v3kn") / "users.json";
+    fs::path backup = path;
+    backup += ".previous";
+    try {
+        if (is_unsafe_account_path("v3kn") || is_unsafe_account_path(path) || is_unsafe_account_path(backup))
+            throw std::runtime_error("Unsafe account index path");
+        std::ifstream input(path);
+        input.exceptions(std::ios::failbit | std::ios::badbit);
+        json index;
+        input >> index;
+        if (!index.is_object() || !index.contains("users") || index["users"] != users
+            || (index.contains("version") ? index.size() != 2 || index["version"] != 2 : index.size() != 1))
+            throw std::runtime_error("Account index changed while server is running");
+        index.erase("version");
+        if (online_id.empty())
+            index["users"].erase(account_id);
+        else
+            index["users"][account_id] = online_id;
+        fs::copy_file(path, backup, fs::copy_options::overwrite_existing);
+        std::ofstream output(path);
+        output.exceptions(std::ios::failbit | std::ios::badbit);
+        output << index.dump(2);
+        output.close();
+        users = std::move(index["users"]);
+    } catch (const std::exception &error) {
+        users_failed = true;
+        log("Account storage failed; restart after fixing the problem: " + std::string(error.what()));
+        throw;
+    }
 }
 
 json load_stitles() {
@@ -263,19 +465,13 @@ size_t get_stitles_cache_size() {
 }
 
 // Token operations
-std::string generate_token() {
-    static const char chars[] = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
-    std::string token;
-    token.resize(48);
-
-    std::random_device rd;
-    std::mt19937 gen(rd());
-    std::uniform_int_distribution<> dist(0, sizeof(chars) - 2);
-
-    for (size_t i = 0; i < 48; ++i)
-        token[i] = chars[dist(gen)];
-
-    return token;
+std::optional<std::string> generate_token() {
+    std::string bytes(32, '\0');
+    if (RAND_bytes(reinterpret_cast<unsigned char *>(bytes.data()), static_cast<int>(bytes.size())) != 1) {
+        log("Failed to generate secure authentication token");
+        return std::nullopt;
+    }
+    return base64_encode(bytes);
 }
 
 std::string get_token_from_request(const httplib::Request &req) {
@@ -309,70 +505,66 @@ std::string get_account_id_from_online_id(const std::string &online_id) {
     return "";
 }
 
-static std::string get_valid_account_id(const httplib::Request &req, const std::string &request, std::string &err) {
+static std::expected<std::string, std::string> get_valid_account_id(const httplib::Request &req, const std::string &request) {
+    if (users_failed)
+        throw std::runtime_error("Account storage unavailable");
     const std::string token = get_token_from_request(req);
     if (token.empty()) {
         log("Missing token on request: " + request);
-        err = "ERR:MissingToken";
-        return {};
+        return std::unexpected("ERR:MissingToken");
     }
 
     const std::string account_id = get_account_id_from_token(token);
     if (account_id.empty()) {
         log("Invalid token on request: " + request);
-        err = "ERR:InvalidToken";
-        return {};
+        return std::unexpected("ERR:InvalidToken");
     }
 
     return account_id;
 }
 
-std::optional<UserAccount> get_valid_account(const httplib::Request &req, const std::string &request, std::string &err) {
-    const std::string account_id = get_valid_account_id(req, request, err);
-    if (account_id.empty())
-        return std::nullopt;
+std::expected<UserAccount, std::string> get_valid_account(const httplib::Request &req, const std::string &request) {
+    const auto account_id = get_valid_account_id(req, request);
+    if (!account_id)
+        return std::unexpected(account_id.error());
 
-    const std::string online_id = get_online_id_from_account_id(account_id);
+    const std::string online_id = get_online_id_from_account_id(*account_id);
     if (online_id.empty()) {
-        err = "ERR:OnlineIDNotFound";
-        return std::nullopt;
+        log("Online ID not found for account ID " + *account_id + " on request: " + request);
+        return std::unexpected("ERR:OnlineIDNotFound");
     }
 
-    return UserAccount{ account_id, online_id };
+    return UserAccount{ *account_id, online_id };
 }
 
-std::optional<UserAccount> get_valid_target_account(const httplib::Request &req, const std::string &request, std::string &err, const std::string &online_id) {
+std::expected<UserAccount, std::string> get_valid_target_account(const httplib::Request &req, const std::string &request, const std::string &online_id) {
     // Get target online_id from parameters
     std::string target_online_id = req.get_param_value("target_online_id");
     if (target_online_id.empty()) {
         log("Online ID " + online_id + " try to get activities with missing target online ID");
-        err = "ERR:MissingTargetOnlineID";
-        return std::nullopt;
+        return std::unexpected("ERR:MissingTargetOnlineID");
     }
 
     const std::string target_account_id = get_account_id_from_online_id(target_online_id);
     if (target_account_id.empty()) {
         log("Online ID " + online_id + " try to get activities for non-existing Account with online ID " + target_online_id);
-        err = "ERR:TargetAccountNotFound";
-        return std::nullopt;
+        return std::unexpected("ERR:TargetAccountNotFound");
     }
 
     target_online_id = get_online_id_from_account_id(target_account_id);
     if (target_online_id.empty()) {
-        log("Online ID " + online_id + " try to get activities for non-existing online ID " + target_online_id);
-        err = "ERR:TargetOnlineIDNotFound";
-        return std::nullopt;
+        log("Online ID " + online_id + " requested an account with no current online ID: " + target_account_id);
+        return std::unexpected("ERR:TargetOnlineIDNotFound");
     }
 
     return UserAccount{ target_account_id, target_online_id };
 }
 
 std::string get_online_id_from_account_id(const std::string &account_id) {
-    std::lock_guard<std::mutex> lock(account_id_cache_mutex);
-    auto it = account_id_cache.find(account_id);
-    if (it != account_id_cache.end()) {
-        return it->second;
-    }
+    std::lock_guard<std::mutex> lock(users_mutex);
+    auto it = users.find(account_id);
+    if (it != users.end())
+        return it->get<std::string>();
 
     return "";
 }
@@ -448,6 +640,14 @@ std::string base64_encode(const std::string &input) {
     return out;
 }
 
+bool json_array_contains(const json &array, const json &value) {
+#if defined(__cpp_lib_ranges_contains) && __cpp_lib_ranges_contains >= 202207L
+    return std::ranges::contains(array, value);
+#else
+    return std::find(array.begin(), array.end(), value) != array.end();
+#endif
+}
+
 std::string lowercase_online_id(std::string online_id) {
     std::transform(online_id.begin(), online_id.end(), online_id.begin(), [](unsigned char c) {
         return static_cast<char>(std::tolower(c));
@@ -491,14 +691,11 @@ void update_remote_addr(const httplib::Request &req, json &user) {
 
 void update_last_activity(const httplib::Request &req, const std::string &account_id) {
     std::lock_guard<std::mutex> lock(account_mutex);
-    json db = load_users();
-    if (!db.contains("users") || !db["users"].contains(account_id))
-        return;
+    json user = accounts.at(account_id);
 
-    auto &user = db["users"][account_id];
     user["last_activity"] = std::time(0);
     update_remote_addr(req, user);
-    save_users(db);
+    save_account(account_id, user);
 }
 
 // Logging

@@ -9,9 +9,12 @@
 #include <nlohmann/json.hpp>
 
 #include <condition_variable>
+#include <atomic>
+#include <expected>
 #include <filesystem>
 #include <functional>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -23,14 +26,18 @@ namespace fs = std::filesystem;
 constexpr uint64_t DEFAULT_QUOTA_TOTAL = 50 * 1024 * 1024; // 50 MB
 
 // Mutexes
+extern std::mutex users_mutex;
 extern std::mutex account_mutex;
+// After startup, each map is protected by its corresponding mutex.
+extern json users; // account_id -> online_id
+extern json accounts; // account_id -> account data
+extern std::atomic<bool> users_failed;
 extern std::mutex stitles_cache_mutex;
 extern std::mutex log_mutex;
 
 // Caches mutexes
 extern std::mutex token_cache_mutex;
 extern std::mutex online_id_cache_mutex;
-extern std::mutex account_id_cache_mutex;
 
 // Condition variable for messages long polling
 extern std::mutex messages_cv_mutex;
@@ -52,9 +59,6 @@ extern std::unordered_map<std::string, std::string> token_cache; // token -> acc
 // Online IDs cache to speed up lookups (not persisted to disk, built on server start and updated on demand)
 extern std::unordered_map<std::string, std::string> online_id_cache; // online_id -> account_id
 
-// Account ID cache to speed up lookups (not persisted to disk, built on server start and updated on demand)
-extern std::unordered_map<std::string, std::string> account_id_cache; // account_id -> online_id
-
 struct UserAccount {
     std::string account_id;
     std::string online_id;
@@ -64,8 +68,11 @@ struct UserAccount {
 json load_profile(const std::string &online_id);
 void save_profile(const std::string &online_id, const json &profile);
 void update_profile(const std::string &online_id, const std::function<void(json &)> &updater);
-json load_users();
-void save_users(const json &db);
+// Account read-modify-write sequences must hold account_mutex.
+void load_users();
+bool is_unsafe_account_path(const fs::path &path);
+void save_account(const std::string &account_id, const json &user);
+void save_users(const std::string &account_id, const std::string &online_id);
 json load_stitles();
 void save_stitles(const json &db);
 void reload_stitles_cache();
@@ -75,13 +82,13 @@ std::string get_stitle_name(const std::string &titleid, const std::string &langu
 size_t get_stitles_cache_size();
 
 // Token/auth operations
-std::string generate_token();
+std::optional<std::string> generate_token();
 std::string get_token_from_request(const httplib::Request &req);
 std::string get_account_id_from_token(const std::string &token);
 std::string get_online_id_from_account_id(const std::string &account_id);
 std::string get_account_id_from_online_id(const std::string &online_id);
-std::optional<UserAccount> get_valid_account(const httplib::Request &req, const std::string &request, std::string &err);
-std::optional<UserAccount> get_valid_target_account(const httplib::Request &req, const std::string &request, std::string &err, const std::string &online_id);
+std::expected<UserAccount, std::string> get_valid_account(const httplib::Request &req, const std::string &request);
+std::expected<UserAccount, std::string> get_valid_target_account(const httplib::Request &req, const std::string &request, const std::string &online_id);
 
 // Crypto operations
 std::vector<unsigned char> generate_salt();
@@ -90,6 +97,7 @@ std::vector<unsigned char> compute_server_hash(const std::string &client_hash, c
 // String operations
 std::string base64_encode(const std::string &input);
 std::string base64_decode(const std::string &encoded);
+bool json_array_contains(const json &array, const json &value);
 std::string lowercase_online_id(std::string online_id);
 std::string trim_online_id(std::string online_id);
 

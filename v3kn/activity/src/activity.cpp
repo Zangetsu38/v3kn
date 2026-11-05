@@ -22,11 +22,7 @@ static int64_t migrate_second_timestamp_to_millis(std::unordered_map<int64_t, in
 
 void migrate_activities_created_at_to_milliseconds() {
     std::lock_guard<std::mutex> lock(account_mutex);
-    json db = load_users();
-    if (!db.contains("users") || !db["users"].is_object())
-        return;
-
-    for (const auto &[account_id, user] : db["users"].items()) {
+    for (const auto &[account_id, user] : accounts.items()) {
         if (!user.contains("online_id") || !user["online_id"].is_string() || user["online_id"].empty())
             continue;
 
@@ -252,10 +248,9 @@ void register_activity_endpoints(httplib::Server &server) {
 void handle_post_activity(const httplib::Request &req, httplib::Response &res) {
     std::shared_lock<std::shared_mutex> lifecycle_lock(account_lifecycle_mutex);
 
-    std::string err;
-    const auto account = get_valid_account(req, "post activity", err);
+    const auto account = get_valid_account(req, "post activity");
     if (!account) {
-        res.set_content(err, "text/plain");
+        res.set_content(account.error(), "text/plain");
         return;
     }
 
@@ -285,19 +280,18 @@ void handle_post_activity(const httplib::Request &req, httplib::Response &res) {
 void handle_like_activity(const httplib::Request &req, httplib::Response &res) {
     std::shared_lock<std::shared_mutex> lifecycle_lock(account_lifecycle_mutex);
 
-    std::string err;
-    const auto account = get_valid_account(req, "like activity", err);
+    const auto account = get_valid_account(req, "like activity");
     if (!account) {
-        res.set_content(err, "text/plain");
+        res.set_content(account.error(), "text/plain");
         return;
     }
 
     const std::string &account_id = account->account_id;
     const std::string &online_id = account->online_id;
 
-    const auto target_account = get_valid_target_account(req, "like activity target", err, online_id);
+    const auto target_account = get_valid_target_account(req, "like activity target", online_id);
     if (!target_account) {
-        res.set_content(err, "text/plain");
+        res.set_content(target_account.error(), "text/plain");
         return;
     }
 
@@ -348,7 +342,7 @@ void handle_like_activity(const httplib::Request &req, httplib::Response &res) {
         }
 
         // Add like if not already liked
-        if (std::find(likes.begin(), likes.end(), account_id) == likes.end()) {
+        if (!json_array_contains(likes, account_id)) {
             likes.push_back(account_id);
         } else {
             log("online ID " + online_id + " try to like activity for online ID " + target_online_id + " but already liked");
@@ -373,19 +367,18 @@ void handle_like_activity(const httplib::Request &req, httplib::Response &res) {
 void handle_unlike_activity(const httplib::Request &req, httplib::Response &res) {
     std::shared_lock<std::shared_mutex> lifecycle_lock(account_lifecycle_mutex);
 
-    std::string err;
-    const auto account = get_valid_account(req, "unlike activity", err);
+    const auto account = get_valid_account(req, "unlike activity");
     if (!account) {
-        res.set_content(err, "text/plain");
+        res.set_content(account.error(), "text/plain");
         return;
     }
 
     const std::string &account_id = account->account_id;
     const std::string &online_id = account->online_id;
 
-    const auto target_account = get_valid_target_account(req, "unlike activity target", err, online_id);
+    const auto target_account = get_valid_target_account(req, "unlike activity target", online_id);
     if (!target_account) {
-        res.set_content(err, "text/plain");
+        res.set_content(target_account.error(), "text/plain");
         return;
     }
 
@@ -450,10 +443,9 @@ void handle_unlike_activity(const httplib::Request &req, httplib::Response &res)
 
 void handle_comment_activity(const httplib::Request &req, httplib::Response &res) {
     std::shared_lock<std::shared_mutex> lifecycle_lock(account_lifecycle_mutex);
-    std::string err;
-    const auto account = get_valid_account(req, "comment activity", err);
+    const auto account = get_valid_account(req, "comment activity");
     if (!account) {
-        res.set_content(err, "text/plain");
+        res.set_content(account.error(), "text/plain");
         return;
     }
 
@@ -580,10 +572,9 @@ void handle_comment_activity(const httplib::Request &req, httplib::Response &res
 
 void handle_uncomment_activity(const httplib::Request &req, httplib::Response &res) {
     std::shared_lock<std::shared_mutex> lifecycle_lock(account_lifecycle_mutex);
-    std::string err;
-    const auto account = get_valid_account(req, "uncomment activity", err);
+    const auto account = get_valid_account(req, "uncomment activity");
     if (!account) {
-        res.set_content(err, "text/plain");
+        res.set_content(account.error(), "text/plain");
         return;
     }
 
@@ -591,9 +582,9 @@ void handle_uncomment_activity(const httplib::Request &req, httplib::Response &r
     const std::string &online_id = account->online_id;
 
     // Get target online ID from parameters
-    const auto target_account = get_valid_target_account(req, "uncomment activity target", err, online_id);
+    const auto target_account = get_valid_target_account(req, "uncomment activity target", online_id);
     if (!target_account) {
-        res.set_content(err, "text/plain");
+        res.set_content(target_account.error(), "text/plain");
         return;
     }
 
@@ -689,10 +680,9 @@ void handle_uncomment_activity(const httplib::Request &req, httplib::Response &r
 
 void handle_delete_activity(const httplib::Request &req, httplib::Response &res) {
     std::shared_lock<std::shared_mutex> lifecycle_lock(account_lifecycle_mutex);
-    std::string err;
-    const auto account = get_valid_account(req, "delete activity", err);
+    const auto account = get_valid_account(req, "delete activity");
     if (!account) {
-        res.set_content(err, "text/plain");
+        res.set_content(account.error(), "text/plain");
         return;
     }
 
@@ -747,10 +737,9 @@ void handle_delete_activity(const httplib::Request &req, httplib::Response &res)
 void handle_get_activities(const httplib::Request &req, httplib::Response &res) {
     std::shared_lock<std::shared_mutex> lifecycle_lock(account_lifecycle_mutex);
 
-    std::string err;
-    const auto account = get_valid_account(req, "get activity", err);
+    const auto account = get_valid_account(req, "get activity");
     if (!account) {
-        res.set_content(err, "text/plain");
+        res.set_content(account.error(), "text/plain");
         return;
     }
 
@@ -809,13 +798,17 @@ void handle_get_activities(const httplib::Request &req, httplib::Response &res) 
     for (const auto &activity : activities["activities"]) {
         json entry = activity;
         auto it = entry.find("account_id");
-        if (it == entry.end()) {
-            log("Online ID " + online_id + " try to get activities for online ID " + target_online_id + " but activity has no account_id");
+        if (it == entry.end() || !it->is_string()) {
+            log("Online ID " + online_id + " tried to get an activity with no valid account ID for " + target_online_id);
             continue;
         }
 
         const std::string activity_account_id = it->get<std::string>();
         const std::string activity_online_id = get_online_id_from_account_id(activity_account_id);
+        if (activity_online_id.empty()) {
+            log("Cannot display activity: online ID not found for account ID " + activity_account_id);
+            continue;
+        }
 
         entry.erase("account_id");
         entry["online_id"] = activity_online_id;
@@ -823,7 +816,10 @@ void handle_get_activities(const httplib::Request &req, httplib::Response &res) 
             const std::string friend_account_id = activity["friend_account_id"].get<std::string>();
             const std::string friend_online_id = get_online_id_from_account_id(friend_account_id);
             entry.erase("friend_account_id");
-            entry["friend_online_id"] = friend_online_id;
+            if (friend_online_id.empty())
+                log("Cannot display activity friend: online ID not found for account ID " + friend_account_id);
+            else
+                entry["friend_online_id"] = friend_online_id;
         }
         if (activity.contains("likes") && activity["likes"].is_array()) {
             json likes = json::array();
@@ -833,7 +829,11 @@ void handle_get_activities(const httplib::Request &req, httplib::Response &res) 
 
                 const std::string like_account_id = like.get<std::string>();
                 const std::string like_online_id = get_online_id_from_account_id(like_account_id);
-                likes.push_back(like_online_id.empty() ? like_account_id : like_online_id);
+                if (like_online_id.empty()) {
+                    log("Cannot display activity like: online ID not found for account ID " + like_account_id);
+                    continue;
+                }
+                likes.push_back(like_online_id);
             }
             entry["likes"] = likes;
         }
@@ -845,11 +845,14 @@ void handle_get_activities(const httplib::Request &req, httplib::Response &res) 
 
                 json comment_entry = comment;
                 if (comment_entry.contains("account_id") && comment_entry["account_id"].is_string()) {
-                    const std::string comment_online_id = get_online_id_from_account_id(comment_entry["account_id"].get<std::string>());
-                    if (!comment_online_id.empty()) {
-                        comment_entry.erase("account_id");
-                        comment_entry["online_id"] = comment_online_id;
+                    const std::string comment_account_id = comment_entry["account_id"].get<std::string>();
+                    const std::string comment_online_id = get_online_id_from_account_id(comment_account_id);
+                    if (comment_online_id.empty()) {
+                        log("Cannot display activity comment: online ID not found for account ID " + comment_account_id);
+                        continue;
                     }
+                    comment_entry.erase("account_id");
+                    comment_entry["online_id"] = comment_online_id;
                 }
                 comments.push_back(comment_entry);
             }

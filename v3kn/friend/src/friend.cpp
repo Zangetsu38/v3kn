@@ -90,6 +90,11 @@ void notify_friend_poll_for_account(const std::string &account_id) {
 }
 
 static void push_status_event_to_friends(const std::string &online_id) {
+    const auto target_account_id = get_account_id_from_online_id(online_id);
+    if (target_account_id.empty()) {
+        log("Cannot send friend status event: account not found for online ID " + online_id);
+        return;
+    }
     json user_friends = load_friends(online_id, "friends");
     std::lock_guard<std::mutex> lock(online_users_mutex);
     for (const auto &f : user_friends) {
@@ -98,7 +103,6 @@ static void push_status_event_to_friends(const std::string &online_id) {
         const std::string friend_account_id = f["account_id"].get<std::string>();
         if (!online_users.contains(friend_account_id))
             continue;
-        const auto target_account_id = get_account_id_from_online_id(online_id);
         push_friend_status_event(friend_account_id, target_account_id);
         notify_friend_poll(friend_account_id);
     }
@@ -348,9 +352,7 @@ void migrate_friends_npid_to_account_id() {
 
     {
         std::lock_guard<std::mutex> lock(account_mutex);
-        json db = load_users();
-
-        for (const auto &[_, user] : db["users"].items()) {
+        for (const auto &[_, user] : accounts.items()) {
             const auto online_id = user["online_id"].get<std::string>();
             std::string path = get_friends_path(online_id);
             if (!fs::exists(path))
@@ -565,19 +567,18 @@ static void fill_presence_fields(json &status_obj, const std::string &account_id
 void handle_friend_add(const httplib::Request &req, httplib::Response &res) {
     std::shared_lock<std::shared_mutex> lifecycle_lock(account_lifecycle_mutex);
 
-    std::string err;
-    const auto account = get_valid_account(req, "friend add request", err);
+    const auto account = get_valid_account(req, "friend add request");
     if (!account) {
-        res.set_content(err, "text/plain");
+        res.set_content(account.error(), "text/plain");
         return;
     }
 
     const std::string &account_id = account->account_id;
     const std::string &online_id = account->online_id;
 
-    const auto target_account = get_valid_target_account(req, "friend add request", err, online_id);
+    const auto target_account = get_valid_target_account(req, "friend add request", online_id);
     if (!target_account) {
-        res.set_content(err, "text/plain");
+        res.set_content(target_account.error(), "text/plain");
         return;
     }
 
@@ -680,19 +681,18 @@ void handle_friend_add(const httplib::Request &req, httplib::Response &res) {
 void handle_friend_accept(const httplib::Request &req, httplib::Response &res) {
     std::shared_lock<std::shared_mutex> lifecycle_lock(account_lifecycle_mutex);
 
-    std::string err;
-    const auto account = get_valid_account(req, "friend accept request", err);
+    const auto account = get_valid_account(req, "friend accept request");
     if (!account) {
-        res.set_content(err, "text/plain");
+        res.set_content(account.error(), "text/plain");
         return;
     }
 
     const std::string &account_id = account->account_id;
     const std::string &online_id = account->online_id;
 
-    const auto target_account = get_valid_target_account(req, "friend accept request", err, online_id);
+    const auto target_account = get_valid_target_account(req, "friend accept request", online_id);
     if (!target_account) {
-        res.set_content(err, "text/plain");
+        res.set_content(target_account.error(), "text/plain");
         return;
     }
 
@@ -705,12 +705,13 @@ void handle_friend_accept(const httplib::Request &req, httplib::Response &res) {
         return;
     }
 
-    json db = load_users();
-
-    if (!db["users"].contains(target_account_id)) {
-        log("Friend accept request to non-existing account ID " + target_account_id + " by " + online_id);
-        res.set_content("ERR:UserNotFound", "text/plain");
-        return;
+    {
+        std::lock_guard<std::mutex> lock(account_mutex);
+        if (!accounts.contains(target_account_id)) {
+            log("Friend accept request to non-existing account ID " + target_account_id + " by " + online_id);
+            res.set_content("ERR:UserNotFound", "text/plain");
+            return;
+        }
     }
 
     ResourceLock friends_lock({ "friends:" + online_id, "friends:" + target_online_id });
@@ -746,19 +747,18 @@ void handle_friend_accept(const httplib::Request &req, httplib::Response &res) {
 void handle_friend_reject(const httplib::Request &req, httplib::Response &res) {
     std::shared_lock<std::shared_mutex> lifecycle_lock(account_lifecycle_mutex);
 
-    std::string err;
-    const auto account = get_valid_account(req, "friend reject request", err);
+    const auto account = get_valid_account(req, "friend reject request");
     if (!account) {
-        res.set_content(err, "text/plain");
+        res.set_content(account.error(), "text/plain");
         return;
     }
 
     const std::string &account_id = account->account_id;
     const std::string &online_id = account->online_id;
 
-    const auto target_account = get_valid_target_account(req, "friend reject request", err, online_id);
+    const auto target_account = get_valid_target_account(req, "friend reject request", online_id);
     if (!target_account) {
-        res.set_content(err, "text/plain");
+        res.set_content(target_account.error(), "text/plain");
         return;
     }
 
@@ -790,19 +790,18 @@ void handle_friend_reject(const httplib::Request &req, httplib::Response &res) {
 void handle_friend_remove(const httplib::Request &req, httplib::Response &res) {
     std::shared_lock<std::shared_mutex> lifecycle_lock(account_lifecycle_mutex);
 
-    std::string err;
-    const auto account = get_valid_account(req, "friend remove request", err);
+    const auto account = get_valid_account(req, "friend remove request");
     if (!account) {
-        res.set_content(err, "text/plain");
+        res.set_content(account.error(), "text/plain");
         return;
     }
 
     const std::string &account_id = account->account_id;
     const std::string &online_id = account->online_id;
 
-    const auto target_account = get_valid_target_account(req, "friend remove request", err, online_id);
+    const auto target_account = get_valid_target_account(req, "friend remove request", online_id);
     if (!target_account) {
-        res.set_content(err, "text/plain");
+        res.set_content(target_account.error(), "text/plain");
         return;
     }
 
@@ -846,19 +845,18 @@ void handle_friend_remove(const httplib::Request &req, httplib::Response &res) {
 void handle_friend_cancel(const httplib::Request &req, httplib::Response &res) {
     std::shared_lock<std::shared_mutex> lifecycle_lock(account_lifecycle_mutex);
 
-    std::string err;
-    const auto account = get_valid_account(req, "friend cancel request", err);
+    const auto account = get_valid_account(req, "friend cancel request");
     if (!account) {
-        res.set_content(err, "text/plain");
+        res.set_content(account.error(), "text/plain");
         return;
     }
 
     const std::string &account_id = account->account_id;
     const std::string &online_id = account->online_id;
 
-    const auto target_account = get_valid_target_account(req, "friend cancel request", err, online_id);
+    const auto target_account = get_valid_target_account(req, "friend cancel request", online_id);
     if (!target_account) {
-        res.set_content(err, "text/plain");
+        res.set_content(target_account.error(), "text/plain");
         return;
     }
 
@@ -897,19 +895,18 @@ void handle_friend_cancel(const httplib::Request &req, httplib::Response &res) {
 void handle_friend_block(const httplib::Request &req, httplib::Response &res) {
     std::shared_lock<std::shared_mutex> lifecycle_lock(account_lifecycle_mutex);
 
-    std::string err;
-    const auto account = get_valid_account(req, "friend block request", err);
+    const auto account = get_valid_account(req, "friend block request");
     if (!account) {
-        res.set_content(err, "text/plain");
+        res.set_content(account.error(), "text/plain");
         return;
     }
 
     const std::string &account_id = account->account_id;
     const std::string &online_id = account->online_id;
 
-    const auto target_account = get_valid_target_account(req, "friend block request", err, online_id);
+    const auto target_account = get_valid_target_account(req, "friend block request", online_id);
     if (!target_account) {
-        res.set_content(err, "text/plain");
+        res.set_content(target_account.error(), "text/plain");
         return;
     }
 
@@ -963,19 +960,18 @@ void handle_friend_block(const httplib::Request &req, httplib::Response &res) {
 void handle_friend_unblock(const httplib::Request &req, httplib::Response &res) {
     std::shared_lock<std::shared_mutex> lifecycle_lock(account_lifecycle_mutex);
 
-    std::string err;
-    const auto account = get_valid_account(req, "friend unblock request", err);
+    const auto account = get_valid_account(req, "friend unblock request");
     if (!account) {
-        res.set_content(err, "text/plain");
+        res.set_content(account.error(), "text/plain");
         return;
     }
 
     const std::string &account_id = account->account_id;
     const std::string &online_id = account->online_id;
 
-    const auto target_account = get_valid_target_account(req, "friend unblock request", err, online_id);
+    const auto target_account = get_valid_target_account(req, "friend unblock request", online_id);
     if (!target_account) {
-        res.set_content(err, "text/plain");
+        res.set_content(target_account.error(), "text/plain");
         return;
     }
 
@@ -1006,10 +1002,9 @@ void handle_friend_unblock(const httplib::Request &req, httplib::Response &res) 
 void handle_friend_list(const httplib::Request &req, httplib::Response &res) {
     std::shared_lock<std::shared_mutex> lifecycle_lock(account_lifecycle_mutex);
 
-    std::string err;
-    const auto account = get_valid_account(req, "friends list request", err);
+    const auto account = get_valid_account(req, "friends list request");
     if (!account) {
-        res.set_content(err, "text/plain");
+        res.set_content(account.error(), "text/plain");
         return;
     }
 
@@ -1074,19 +1069,18 @@ void handle_friend_list(const httplib::Request &req, httplib::Response &res) {
 void handle_friend_profile(const httplib::Request &req, httplib::Response &res) {
     std::shared_lock<std::shared_mutex> lifecycle_lock(account_lifecycle_mutex);
 
-    std::string err;
-    const auto account = get_valid_account(req, "friends profile request", err);
+    const auto account = get_valid_account(req, "friends profile request");
     if (!account) {
-        res.set_content(err, "text/plain");
+        res.set_content(account.error(), "text/plain");
         return;
     }
 
     const std::string &account_id = account->account_id;
     const std::string &online_id = account->online_id;
 
-    const auto target_account = get_valid_target_account(req, "friend profile request", err, online_id);
+    const auto target_account = get_valid_target_account(req, "friend profile request", online_id);
     if (!target_account) {
-        res.set_content(err, "text/plain");
+        res.set_content(target_account.error(), "text/plain");
         return;
     }
 
@@ -1147,10 +1141,9 @@ void handle_friend_profile(const httplib::Request &req, httplib::Response &res) 
 
 void handle_friend_poll(const httplib::Request &req, httplib::Response &res) {
     std::shared_lock<std::shared_mutex> lifecycle_lock(account_lifecycle_mutex);
-    std::string err;
-    auto account = get_valid_account(req, "friends poll request", err);
+    auto account = get_valid_account(req, "friends poll request");
     if (!account) {
-        res.set_content(err, "text/plain");
+        res.set_content(account.error(), "text/plain");
         return;
     }
 
@@ -1293,9 +1286,9 @@ void handle_friend_poll(const httplib::Request &req, httplib::Response &res) {
             poll_signal->cv.wait_for(lock, remaining, [&] { return poll_signal->generation != generation; });
         }
         lifecycle_lock.lock();
-        account = get_valid_account(req, "friends poll request", err);
+        account = get_valid_account(req, "friends poll request");
         if (!account) {
-            res.set_content(err, "text/plain");
+            res.set_content(account.error(), "text/plain");
             return;
         }
         online_id = account->online_id;
@@ -1305,10 +1298,9 @@ void handle_friend_poll(const httplib::Request &req, httplib::Response &res) {
 
 void handle_friend_presence(const httplib::Request &req, httplib::Response &res) {
     std::shared_lock<std::shared_mutex> lifecycle_lock(account_lifecycle_mutex);
-    std::string err;
-    const auto account = get_valid_account(req, "friends presence", err);
+    const auto account = get_valid_account(req, "friends presence");
     if (!account) {
-        res.set_content(err, "text/plain");
+        res.set_content(account.error(), "text/plain");
         return;
     }
 
@@ -1403,10 +1395,9 @@ void handle_friend_presence(const httplib::Request &req, httplib::Response &res)
 
 void handle_friend_search(const httplib::Request &req, httplib::Response &res) {
     std::shared_lock<std::shared_mutex> lifecycle_lock(account_lifecycle_mutex);
-    std::string err;
-    const auto account = get_valid_account(req, "friends search", err);
+    const auto account = get_valid_account(req, "friends search");
     if (!account) {
-        res.set_content(err, "text/plain");
+        res.set_content(account.error(), "text/plain");
         return;
     }
 
@@ -1422,29 +1413,18 @@ void handle_friend_search(const httplib::Request &req, httplib::Response &res) {
     // Case-insensitive search
     query = lowercase_online_id(query);
 
-    json db = load_users();
-
-    if (!db["users"].is_object()) {
-        log("Invalid users database format");
-        res.set_content("ERR:InternalError", "text/plain");
-        return;
-    }
-
     json results = json::array();
-    for (const auto &[user_account_id, user] : db["users"].items()) {
-        if (user_account_id == account_id)
-            continue;
-
-        if (!user.contains("online_id") || !user["online_id"].is_string() || user["online_id"].empty())
-            continue;
-
-        const std::string user_online_id = user["online_id"];
-        const std::string lower_online_id = lowercase_online_id(user_online_id);
-
-        if (lower_online_id.find(query) != std::string::npos) {
-            json entry;
-            entry["online_id"] = user_online_id;
-            results.push_back(entry);
+    {
+        std::lock_guard<std::mutex> lock(users_mutex);
+        for (const auto &[user_account_id, name] : users.items()) {
+            if (user_account_id == account_id)
+                continue;
+            const std::string user_online_id = name.get<std::string>();
+            if (lowercase_online_id(user_online_id).find(query) != std::string::npos) {
+                json entry;
+                entry["online_id"] = user_online_id;
+                results.push_back(entry);
+            }
         }
     }
 

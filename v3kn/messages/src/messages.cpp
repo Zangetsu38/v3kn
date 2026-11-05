@@ -166,10 +166,9 @@ static bool is_user_in_conversation(const std::string &conversation_id, const st
 void handle_messages_create(const httplib::Request &req, httplib::Response &res) {
     std::shared_lock<std::shared_mutex> lifecycle_lock(account_lifecycle_mutex);
 
-    std::string err;
-    const auto account = get_valid_account(req, "create conversation request", err);
+    const auto account = get_valid_account(req, "create conversation request");
     if (!account) {
-        res.set_content(err, "text/plain");
+        res.set_content(account.error(), "text/plain");
         return;
     }
 
@@ -216,7 +215,21 @@ void handle_messages_create(const httplib::Request &req, httplib::Response &res)
             return;
         }
         std::string participant = trim_online_id(p.get<std::string>());
-        if (!participant.empty() && participant != online_id) {
+        if (!participant.empty()) {
+            const auto participant_id = get_account_id_from_online_id(participant);
+            if (participant_id.empty()) {
+                log("Create conversation request with non-existing participant " + participant + " by " + online_id);
+                res.set_content("ERR:ParticipantNotFound:" + participant, "text/plain");
+                return;
+            }
+            participant = get_online_id_from_account_id(participant_id);
+            if (participant.empty()) {
+                log("Create conversation request with no current online ID for account " + participant_id);
+                res.set_content("ERR:ParticipantNotFound", "text/plain");
+                return;
+            }
+        }
+        if (!participant.empty() && participant != online_id && std::find(participants.begin(), participants.end(), participant) == participants.end()) {
             participants.push_back(participant);
         }
     }
@@ -225,17 +238,6 @@ void handle_messages_create(const httplib::Request &req, httplib::Response &res)
         log("Conversation must have at least 2 participants (from " + online_id + ")");
         res.set_content("ERR:NotEnoughParticipants", "text/plain");
         return;
-    }
-
-    json db = load_users();
-
-    // Verify all participants exist
-    for (const auto &p : participants) {
-        if (!db["users"].contains(p)) {
-            log("Create conversation request with non-existing participant " + p + " by " + online_id);
-            res.set_content("ERR:ParticipantNotFound:" + p, "text/plain");
-            return;
-        }
     }
 
     // Generate conversation ID
@@ -271,7 +273,7 @@ void handle_messages_create(const httplib::Request &req, httplib::Response &res)
     // Add conversation to each participant's list
     for (const auto &p : participants) {
         update_user_conversations(p, [&](json &user_conversations) {
-            if (std::find(user_conversations.begin(), user_conversations.end(), conversation_id) == user_conversations.end())
+            if (!json_array_contains(user_conversations, conversation_id))
                 user_conversations.push_back(conversation_id);
         });
     }
@@ -286,10 +288,9 @@ void handle_messages_create(const httplib::Request &req, httplib::Response &res)
 void handle_messages_send(const httplib::Request &req, httplib::Response &res) {
     std::shared_lock<std::shared_mutex> lifecycle_lock(account_lifecycle_mutex);
 
-    std::string err;
-    const auto account = get_valid_account(req, "message send request", err);
+    const auto account = get_valid_account(req, "message send request");
     if (!account) {
-        res.set_content(err, "text/plain");
+        res.set_content(account.error(), "text/plain");
         return;
     }
 
@@ -357,10 +358,9 @@ void handle_messages_send(const httplib::Request &req, httplib::Response &res) {
 void handle_messages_delete(const httplib::Request &req, httplib::Response &res) {
     std::shared_lock<std::shared_mutex> lifecycle_lock(account_lifecycle_mutex);
 
-    std::string err;
-    const auto account = get_valid_account(req, "message delete request", err);
+    const auto account = get_valid_account(req, "message delete request");
     if (!account) {
-        res.set_content(err, "text/plain");
+        res.set_content(account.error(), "text/plain");
         return;
     }
 
@@ -469,10 +469,9 @@ void handle_messages_delete(const httplib::Request &req, httplib::Response &res)
 void handle_messages_add_participant(const httplib::Request &req, httplib::Response &res) {
     std::shared_lock<std::shared_mutex> lifecycle_lock(account_lifecycle_mutex);
 
-    std::string err;
-    const auto account = get_valid_account(req, "add participant request", err);
+    const auto account = get_valid_account(req, "add participant request");
     if (!account) {
-        res.set_content(err, "text/plain");
+        res.set_content(account.error(), "text/plain");
         return;
     }
 
@@ -502,7 +501,7 @@ void handle_messages_add_participant(const httplib::Request &req, httplib::Respo
     }
 
     const std::string conversation_id = request_data["conversation_id"].get<std::string>();
-    const std::string new_participant = trim_online_id(request_data["participant"].get<std::string>());
+    std::string new_participant = trim_online_id(request_data["participant"].get<std::string>());
 
     if (new_participant.empty()) {
         log("Empty participant in add participant request from " + online_id);
@@ -510,11 +509,16 @@ void handle_messages_add_participant(const httplib::Request &req, httplib::Respo
         return;
     }
 
-    json db = load_users();
-
     // Verify new participant exists
-    if (!db["users"].contains(new_participant)) {
+    const auto participant_id = get_account_id_from_online_id(new_participant);
+    if (participant_id.empty()) {
         log("Add participant request with non-existing user " + new_participant + " by " + online_id);
+        res.set_content("ERR:ParticipantNotFound", "text/plain");
+        return;
+    }
+    new_participant = get_online_id_from_account_id(participant_id);
+    if (new_participant.empty()) {
+        log("Add participant request with no current online ID for account " + participant_id);
         res.set_content("ERR:ParticipantNotFound", "text/plain");
         return;
     }
@@ -548,7 +552,7 @@ void handle_messages_add_participant(const httplib::Request &req, httplib::Respo
 
     // Add conversation to new participant's list
     update_user_conversations(new_participant, [&](json &user_conversations) {
-        if (std::find(user_conversations.begin(), user_conversations.end(), conversation_id) == user_conversations.end())
+        if (!json_array_contains(user_conversations, conversation_id))
             user_conversations.push_back(conversation_id);
     });
 
@@ -562,10 +566,9 @@ void handle_messages_add_participant(const httplib::Request &req, httplib::Respo
 void handle_messages_leave(const httplib::Request &req, httplib::Response &res) {
     std::shared_lock<std::shared_mutex> lifecycle_lock(account_lifecycle_mutex);
 
-    std::string err;
-    const auto account = get_valid_account(req, "leave conversation request", err);
+    const auto account = get_valid_account(req, "leave conversation request");
     if (!account) {
-        res.set_content(err, "text/plain");
+        res.set_content(account.error(), "text/plain");
         return;
     }
 
@@ -634,10 +637,9 @@ void handle_messages_leave(const httplib::Request &req, httplib::Response &res) 
 void handle_messages_delete_conversation(const httplib::Request &req, httplib::Response &res) {
     std::shared_lock<std::shared_mutex> lifecycle_lock(account_lifecycle_mutex);
 
-    std::string err;
-    const auto account = get_valid_account(req, "delete conversation request", err);
+    const auto account = get_valid_account(req, "delete conversation request");
     if (!account) {
-        res.set_content(err, "text/plain");
+        res.set_content(account.error(), "text/plain");
         return;
     }
 
@@ -706,10 +708,9 @@ void handle_messages_delete_conversation(const httplib::Request &req, httplib::R
 void handle_messages_conversations(const httplib::Request &req, httplib::Response &res) {
     std::shared_lock<std::shared_mutex> lifecycle_lock(account_lifecycle_mutex);
 
-    std::string err;
-    const auto account = get_valid_account(req, "conversations list request", err);
+    const auto account = get_valid_account(req, "conversations list request");
     if (!account) {
-        res.set_content(err, "text/plain");
+        res.set_content(account.error(), "text/plain");
         return;
     }
 
@@ -755,10 +756,9 @@ void handle_messages_conversations(const httplib::Request &req, httplib::Respons
 void handle_messages_read(const httplib::Request &req, httplib::Response &res) {
     std::shared_lock<std::shared_mutex> lifecycle_lock(account_lifecycle_mutex);
 
-    std::string err;
-    const auto account = get_valid_account(req, "messages read request", err);
+    const auto account = get_valid_account(req, "messages read request");
     if (!account) {
-        res.set_content(err, "text/plain");
+        res.set_content(account.error(), "text/plain");
         return;
     }
 
@@ -797,10 +797,9 @@ void handle_messages_read(const httplib::Request &req, httplib::Response &res) {
 
 void handle_messages_poll(const httplib::Request &req, httplib::Response &res) {
     std::shared_lock<std::shared_mutex> lifecycle_lock(account_lifecycle_mutex);
-    std::string err;
-    auto account = get_valid_account(req, "messages poll request", err);
+    auto account = get_valid_account(req, "messages poll request");
     if (!account) {
-        res.set_content(err, "text/plain");
+        res.set_content(account.error(), "text/plain");
         return;
     }
 
@@ -882,9 +881,9 @@ void handle_messages_poll(const httplib::Request &req, httplib::Response &res) {
             messages_cv.wait_for(lock, remaining, [&] { return messages_generation != generation; });
         }
         lifecycle_lock.lock();
-        account = get_valid_account(req, "messages poll request", err);
+        account = get_valid_account(req, "messages poll request");
         if (!account) {
-            res.set_content(err, "text/plain");
+            res.set_content(account.error(), "text/plain");
             return;
         }
         online_id = account->online_id;
